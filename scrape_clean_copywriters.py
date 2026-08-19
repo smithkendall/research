@@ -30,7 +30,9 @@ Confirmed endpoint contract (checked against api/README.md in the repo,
   - after/before: unix timestamps (post/comment creation time)
   - limit: 1-100 (or "auto"); we use 100
   - sort: asc|desc
-  - fields: comma-separated field allow-list
+  - fields: comma-separated field allow-list (does NOT include "permalink"
+    or comment-only vs. post-only fields like link_flair_text on comments;
+    permalinks are reconstructed locally from id/link_id instead)
 
 Usage
 -----
@@ -65,8 +67,8 @@ MIN_WORDS = 20
 REMOVED_MARKERS = {"[removed]", "[deleted]", ""}
 BOT_AUTHORS = {"automoderator", "automod", "reddit"}
 
-POST_FIELDS = "id,permalink,created_utc,subreddit,title,selftext,score,num_comments,link_flair_text,author"
-COMMENT_FIELDS = "id,permalink,created_utc,subreddit,body,score,link_id,parent_id,link_flair_text,author"
+POST_FIELDS = "id,created_utc,subreddit,title,selftext,score,num_comments,link_flair_text,author"
+COMMENT_FIELDS = "id,created_utc,subreddit,body,score,link_id,parent_id,author"
 
 
 def iso_date(ts) -> str | None:
@@ -87,12 +89,19 @@ def is_removed_marker(text: str) -> bool:
     return (text or "").strip().lower() in REMOVED_MARKERS
 
 
-def full_permalink(permalink: str | None) -> str | None:
-    if not permalink:
+def build_permalink(item: dict, item_type: str) -> str | None:
+    """Arctic Shift's fields allow-list rejects 'permalink' directly, so
+    reconstruct it from id (+ link_id for comments); Reddit resolves these
+    slug-less permalinks fine."""
+    item_id = item.get("id")
+    if not item_id:
         return None
-    if permalink.startswith("http"):
-        return permalink
-    return f"https://www.reddit.com{permalink}"
+    if item_type == "post":
+        return f"https://www.reddit.com/r/{SUBREDDIT}/comments/{item_id}/"
+    link_id = (item.get("link_id") or "").removeprefix("t3_")
+    if not link_id:
+        return None
+    return f"https://www.reddit.com/r/{SUBREDDIT}/comments/{link_id}/_/{item_id}/"
 
 
 def fetch_page(endpoint: str, params: dict) -> list:
@@ -175,7 +184,7 @@ def process_item(item: dict, item_type: str) -> dict | None:
 
     return {
         "id": item.get("id"),
-        "permalink": full_permalink(item.get("permalink")),
+        "permalink": build_permalink(item, item_type),
         "created_utc": iso_date(item.get("created_utc")),
         "subreddit": item.get("subreddit"),
         "type": item_type,
