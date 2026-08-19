@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Raw pulled research data -- left in the working directory for the
+# researcher to review before it's committed, never committed automatically.
+*_corpus.jsonl
