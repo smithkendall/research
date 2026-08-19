@@ -39,6 +39,12 @@ Usage
     python3 scrape_clean_copywriters.py --start 2024-08-01 --end 2026-07-31 \
         --out copywriters_corpus.jsonl
 
+    # Topic slice of a larger, general subreddit (posts filtered locally by
+    # keyword, comments restricted to those posts' threads):
+    python3 scrape_clean_copywriters.py --subreddit advertising \
+        --title-keywords "copywriting,copywriter,copywriters,copy writer,copy writing,ad copy,sales copy" \
+        --start 2024-08-01 --end 2026-07-31 --out advertising_copywriting_corpus.jsonl
+
 Requires only the Python standard library.
 """
 
@@ -56,11 +62,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 API_BASE = "https://arctic-shift.photon-reddit.com/api"
-SUBREDDIT = "copywriters"
+SUBREDDIT = "copywriters"  # overwritten from --subreddit in main()
 PAGE_LIMIT = 100
 REQUEST_TIMEOUT = 60
-MAX_RETRIES = 5
-SLEEP_BETWEEN_REQUESTS = 0.5
+MAX_RETRIES = 8
+SLEEP_BETWEEN_REQUESTS = 1.5
 USER_AGENT = "copywriters-research-corpus/1.0 (academic research, IRB-approved)"
 
 MIN_WORDS = 20
@@ -120,6 +126,14 @@ def fetch_page(endpoint: str, params: dict) -> list:
                 print(f"  rate limited; waiting {wait}s", file=sys.stderr)
                 time.sleep(wait)
                 continue
+            if e.code == 422:
+                # Arctic Shift's own soft rate limit: {"error":"Timeout. Maybe
+                # slow down a bit"} -- transient, same request succeeds after
+                # backing off.
+                wait = min(2**attempt, 60)
+                print(f"  soft rate limit (422); retrying in {wait}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
             if e.code >= 500:
                 wait = min(2**attempt, 60)
                 print(f"  server error {e.code}; retrying in {wait}s", file=sys.stderr)
@@ -134,7 +148,7 @@ def fetch_page(endpoint: str, params: dict) -> list:
     raise RuntimeError(f"Failed to fetch {endpoint} after {MAX_RETRIES} retries: {last_err}")
 
 
-def fetch_all(item_type: str, start_ts: int, end_ts: int) -> list:
+def fetch_all(item_type: str, start_ts: int, end_ts: int, extra_params: dict | None = None) -> list:
     """Paginate /api/{posts,comments}/search ascending by created_utc."""
     endpoint = f"{item_type}/search"
     fields = POST_FIELDS if item_type == "posts" else COMMENT_FIELDS
@@ -149,6 +163,8 @@ def fetch_all(item_type: str, start_ts: int, end_ts: int) -> list:
             "sort": "asc",
             "fields": fields,
         }
+        if extra_params:
+            params.update(extra_params)
         items = fetch_page(endpoint, params)
         if not items:
             break
@@ -159,6 +175,32 @@ def fetch_all(item_type: str, start_ts: int, end_ts: int) -> list:
         print(f"  {item_type}: {len(results)} fetched so far (up to {iso_date(cursor)})", file=sys.stderr)
         if len(items) < PAGE_LIMIT:
             break
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+    return results
+
+
+def matches_topic(item: dict, keywords: list[str]) -> bool:
+    """Case-insensitive substring match of any keyword against title+selftext.
+
+    Done locally rather than via the API's title=/selftext=/query= search
+    params: those use tokenized (not substring) matching, are documented as
+    unsupported on very active subreddits, and returned flaky 500s/timeouts
+    when probed manually -- a plain local filter over the already-paginated
+    post list is simpler and more predictable.
+    """
+    haystack = f"{item.get('title') or ''} {item.get('selftext') or ''}".lower()
+    return any(kw.lower() in haystack for kw in keywords)
+
+
+def fetch_comments_for_posts(post_ids: list[str], start_ts: int, end_ts: int) -> list:
+    """Fetch comments only on the given posts, via the comments/search
+    link_id filter (one paginated pull per post) -- used when a topic
+    filter narrows posts down, so we don't have to pull every comment in
+    a large, mostly-unrelated subreddit just to find the relevant ones."""
+    results = []
+    for i, post_id in enumerate(post_ids, 1):
+        print(f"  comments for post {i}/{len(post_ids)} ({post_id}) ...", file=sys.stderr)
+        results.extend(fetch_all("comments", start_ts, end_ts, extra_params={"link_id": f"t3_{post_id}"}))
         time.sleep(SLEEP_BETWEEN_REQUESTS)
     return results
 
@@ -199,19 +241,45 @@ def process_item(item: dict, item_type: str) -> dict | None:
 
 
 def main() -> None:
+    global SUBREDDIT
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--start", default="2024-08-01", help="Start date YYYY-MM-DD (inclusive)")
     parser.add_argument("--end", default="2026-07-31", help="End date YYYY-MM-DD (inclusive)")
     parser.add_argument("--out", default="copywriters_corpus.jsonl", help="Output JSONL path")
+    parser.add_argument("--subreddit", default="copywriters", help="Subreddit to pull from (no r/ prefix)")
+    parser.add_argument(
+        "--title-keywords",
+        default=None,
+        help=(
+            "Comma-separated keywords; when set, restricts posts to those whose "
+            "title or selftext contains any keyword (case-insensitive substring), "
+            "and restricts comments to those posts' threads instead of pulling "
+            "every comment in the subreddit. Use for large/general subreddits "
+            "where only a topic slice is relevant."
+        ),
+    )
     args = parser.parse_args()
+    SUBREDDIT = args.subreddit
+    keywords = [k.strip() for k in args.title_keywords.split(",")] if args.title_keywords else None
 
     start_ts = int(datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
     end_ts = int(datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) + 86400
 
     print(f"Fetching posts from r/{SUBREDDIT}: {args.start} to {args.end} ...")
     raw_posts = fetch_all("posts", start_ts, end_ts)
-    print(f"Fetching comments from r/{SUBREDDIT}: {args.start} to {args.end} ...")
-    raw_comments = fetch_all("comments", start_ts, end_ts)
+
+    if keywords:
+        matched_posts = [p for p in raw_posts if matches_topic(p, keywords)]
+        print(
+            f"Topic filter matched {len(matched_posts)}/{len(raw_posts)} posts on keywords: {keywords}",
+            file=sys.stderr,
+        )
+        raw_posts = matched_posts
+        print(f"Fetching comments on the {len(raw_posts)} matched posts from r/{SUBREDDIT} ...")
+        raw_comments = fetch_comments_for_posts([p["id"] for p in raw_posts if p.get("id")], start_ts, end_ts)
+    else:
+        print(f"Fetching comments from r/{SUBREDDIT}: {args.start} to {args.end} ...")
+        raw_comments = fetch_all("comments", start_ts, end_ts)
 
     total_pulled = len(raw_posts) + len(raw_comments)
 
